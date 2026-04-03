@@ -10,6 +10,7 @@ This module applies that configuration to per-user state.
         "email": str,
         "status": "in_progress" | "accepted" | "rejected",
         "completed_tasks": list[str],  # keys "step_name.task_name" that passed
+        "attempted_tasks": set[str],   # keys submitted with a valid payload (pass or fail)
         "context": dict,               # e.g. iq_test_score for visibility rules
     }
 
@@ -23,7 +24,7 @@ completing either one with a passing score satisfies that step (OR semantics).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -38,6 +39,19 @@ from app.admissions_config import (
 )
 
 
+class StepProgress(NamedTuple):
+    """Result of ``_step_progress``.
+
+    ``current_step_number`` is the 1-based index of the first step with outstanding
+    work, or ``None`` when there is none.  ``is_terminal`` distinguishes the two
+    ``None`` cases: a terminal user (accepted/rejected) vs an in-progress user with
+    no remaining visible work (edge case that should not normally occur).
+    """
+    current_step_number: int | None
+    total_steps: int
+    is_terminal: bool
+
+
 class AdmissionsService:
     """Holds the configured flow and an in-memory map of users.
 
@@ -45,18 +59,25 @@ class AdmissionsService:
     read status, and complete tasks with webhook-style payloads.
     """
 
-    def __init__(self) -> None:
-        self.flow: list[StepDefinition] = build_flow()
+    def __init__(self, flow: list[StepDefinition] | None = None) -> None:
+        # Accepts a custom flow for testing or PM-driven overrides; defaults to the production config.
+        self.flow: list[StepDefinition] = flow if flow is not None else build_flow()
+        # Lookup dict for O(1) step resolution by name.
         self._steps: dict[str, StepDefinition] = {s.name: s for s in self.flow}
+        # All user state lives here; keyed by UUID user_id.
         self.users: dict[str, dict[str, Any]] = {}
 
     def create_user(self, email: str) -> str:
         """Create a user in ``in_progress`` with empty progress; return a new unique id."""
+        # One account per email address — reject duplicates before creating.
+        if any(u["email"] == email for u in self.users.values()):
+            raise HTTPException(status_code=409, detail="A user with this email already exists")
         user_id = str(uuid4())
         self.users[user_id] = {
             "email": email,
             "status": "in_progress",
             "completed_tasks": [],
+            "attempted_tasks": set(),
             "context": {},
         }
         return user_id
@@ -73,6 +94,7 @@ class AdmissionsService:
         ctx = user.get("context") or {}
         out: list[str] = []
         for task in step.tasks:
+            # Tasks with no visibility_rule are always visible.
             if task.visibility_rule is None or task.visibility_rule(ctx):
                 out.append(task.name)
         return out
@@ -88,23 +110,9 @@ class AdmissionsService:
         return None
 
     def _step_fully_done(self, step: StepDefinition, user: dict[str, Any], done: set[str]) -> bool:
-        """Whether every visible task in ``step`` is satisfied for this user.
-
-        The IQ step is special: if both the initial and second-chance tasks are
-        visible, only one of them needs to appear in ``done`` (passing score).
-        """
+        """Whether the step is satisfied for this user, according to its completion_rule."""
         visible = self._visible_task_names(step, user)
-        if not visible:
-            return True
-        if (
-            step.name == STEP_IQ_TEST
-            and TASK_TAKE_IQ_TEST in visible
-            and TASK_SECOND_CHANCE_TEST in visible
-        ):
-            k1 = f"{step.name}.{TASK_TAKE_IQ_TEST}"
-            k2 = f"{step.name}.{TASK_SECOND_CHANCE_TEST}"
-            return k1 in done or k2 in done
-        return all(f"{step.name}.{n}" in done for n in visible)
+        return step.completion_rule(step.name, visible, done)
 
     def _all_flow_requirements_met(self, user: dict[str, Any], done: set[str]) -> bool:
         """True when every step in the flow is fully done for this user."""
@@ -112,43 +120,65 @@ class AdmissionsService:
 
     def _recompute_user_status(self, user: dict[str, Any]) -> None:
         """Set ``accepted`` if all steps are done; otherwise ``in_progress``. No-op if ``rejected``."""
+        # Rejection is terminal — once rejected, status never changes back.
         if user["status"] == "rejected":
             return
         done = set(user["completed_tasks"])
         user["status"] = "accepted" if self._all_flow_requirements_met(user, done) else "in_progress"
 
-    def _step_progress(self, user: dict[str, Any]) -> tuple[int | None, int]:
-        """1-based index of the first step that still has incomplete work, and total step count.
+    def _step_progress(self, user: dict[str, Any]) -> StepProgress:
+        """Return progress metadata for the given user.
 
-        Returns ``(None, total)`` when the user is not ``in_progress`` or there is
-        no remaining work under the current rules.
+        ``is_terminal=True`` when the user is accepted or rejected — callers should
+        hide the step counter in that case.  ``is_terminal=False`` with
+        ``current_step_number=None`` is an edge case meaning the user is still
+        ``in_progress`` but no visible incomplete task was found (should not normally
+        occur once all completion rules and visibility rules are consistent).
         """
         total = len(self.flow)
         if user["status"] != "in_progress":
-            return None, total
+            return StepProgress(current_step_number=None, total_steps=total, is_terminal=True)
         done = set(user["completed_tasks"])
         for i, step in enumerate(self.flow):
             if self._step_fully_done(step, user, done):
                 continue
             for name in self._visible_task_names(step, user):
-                key = f"{step.name}.{name}"
-                if key not in done:
-                    return i + 1, total
-        return None, total
+                if f"{step.name}.{name}" not in done:
+                    return StepProgress(current_step_number=i + 1, total_steps=total, is_terminal=False)
+        return StepProgress(current_step_number=None, total_steps=total, is_terminal=False)
 
     def get_flow(self, user_id: str) -> dict[str, Any]:
-        """Return all steps with completion flags plus ``current_step_number`` and ``total_steps``."""
+        """Return all steps with per-task completion flags plus ``current_step_number`` and ``total_steps``.
+
+        Only currently visible tasks are included in each step's ``tasks`` list.
+        Hidden tasks (e.g. second_chance_test before a medium IQ score is recorded) are omitted.
+        """
         user = self._get_user(user_id)
         done = set(user["completed_tasks"])
         steps_out: list[dict[str, Any]] = []
         for step in self.flow:
             step_done = self._step_fully_done(step, user, done)
-            steps_out.append({"name": step.name, "completed": step_done})
-        current_n, total = self._step_progress(user)
+            visible = set(self._visible_task_names(step, user))
+            tasks_out = [
+                {
+                    "name": t.name,
+                    "label": t.label,
+                    "completed": f"{step.name}.{t.name}" in done,
+                }
+                for t in step.tasks
+                if t.name in visible
+            ]
+            steps_out.append({
+                "name": step.name,
+                "label": step.label,
+                "completed": step_done,
+                "tasks": tasks_out,
+            })
+        progress = self._step_progress(user)
         return {
             "user_id": user_id,
-            "total_steps": total,
-            "current_step_number": current_n,
+            "total_steps": progress.total_steps,
+            "current_step_number": progress.current_step_number,
             "steps": steps_out,
         }
 
@@ -159,15 +189,16 @@ class AdmissionsService:
         "step x of y" when the user is still in progress.
         """
         user = self._get_user(user_id)
-        current_n, total = self._step_progress(user)
-        if user["status"] != "in_progress":
+        progress = self._step_progress(user)
+        # User is accepted or rejected — no current task to show.
+        if progress.is_terminal:
             return {
                 "user_id": user_id,
                 "step_name": None,
                 "task_name": None,
                 "done": True,
-                "current_step_number": current_n,
-                "total_steps": total,
+                "current_step_number": progress.current_step_number,
+                "total_steps": progress.total_steps,
             }
         done = set(user["completed_tasks"])
         for step in self.flow:
@@ -175,11 +206,6 @@ class AdmissionsService:
                 continue
             visible = self._visible_task_names(step, user)
 
-            # Special behavior for the IQ step:
-            # - when both IQ tasks are visible (medium score => second chance available),
-            #   we want the "current task" to point to the second-chance task, not keep
-            #   returning the first IQ attempt that may have failed its pass condition.
-            # - step completion still depends on passing, so we only change "current".
             if (
                 step.name == STEP_IQ_TEST
                 and TASK_TAKE_IQ_TEST in visible
@@ -192,8 +218,8 @@ class AdmissionsService:
                         "step_name": step.name,
                         "task_name": TASK_SECOND_CHANCE_TEST,
                         "done": False,
-                        "current_step_number": current_n,
-                        "total_steps": total,
+                        "current_step_number": progress.current_step_number,
+                        "total_steps": progress.total_steps,
                     }
 
             for name in visible:
@@ -204,16 +230,17 @@ class AdmissionsService:
                         "step_name": step.name,
                         "task_name": name,
                         "done": False,
-                        "current_step_number": current_n,
-                        "total_steps": total,
+                        "current_step_number": progress.current_step_number,
+                        "total_steps": progress.total_steps,
                     }
+        # All visible tasks are done but status hasn't flipped yet — shouldn't normally happen.
         return {
             "user_id": user_id,
             "step_name": None,
             "task_name": None,
             "done": True,
-            "current_step_number": current_n,
-            "total_steps": total,
+            "current_step_number": progress.current_step_number,
+            "total_steps": progress.total_steps,
         }
 
     def get_status(self, user_id: str) -> dict[str, str]:
@@ -221,61 +248,107 @@ class AdmissionsService:
         user = self._get_user(user_id)
         return {"user_id": user_id, "status": user["status"]}
 
-    def _touch_iq_context(self, user: dict[str, Any], step_name: str, task_name: str, payload: dict[str, Any]) -> None:
-        """Store ``payload["score"]`` on the user when completing an IQ task so visibility rules can run."""
-        if step_name != "iq_test" or task_name not in ("take_iq_test", "second_chance_test"):
-            return
-        score = payload.get("score")
-        if isinstance(score, (int, float)):
-            user.setdefault("context", {})["iq_test_score"] = score
-
     def complete_task(
         self, user_id: str, step_name: str, task_name: str, payload: dict[str, Any]
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Apply webhook-style completion: validate, evaluate pass/reject rules, update user state when applicable.
 
         Raises ``HTTPException`` for unknown user (404), bad step/task or hidden task (400),
         missing required payload fields (400), or completion when already ``accepted``/``rejected`` (400).
 
         On success or idempotent replay of an already-passed task, returns a dict including
-        ``passed`` as the strings ``"true"`` or ``"false"`` (whether this attempt satisfied
-        ``pass_rule`` and was or was already counted as completed).
+        ``passed`` as a boolean (whether this attempt satisfied ``pass_rule`` and was or was
+        already counted as completed).
         """
         user = self._get_user(user_id)
+        # Accepted and rejected are terminal states — no further task completions allowed.
         if user["status"] in ("rejected", "accepted"):
-            raise HTTPException(status_code=400, detail="Cannot complete tasks in current status")
+            raise HTTPException(status_code=400, detail=f"Cannot complete tasks for a user with status '{user['status']}'")
 
+        # --- Validate step and task identity ---
         step = self._steps.get(step_name)
         if step is None:
             raise HTTPException(status_code=400, detail="Invalid step_name")
         task_def = self._task_def(step_name, task_name)
         if task_def is None:
             raise HTTPException(status_code=400, detail="Invalid task_name for the given step_name")
+        # Blocks access to tasks hidden by a visibility_rule (e.g. second chance before IQ attempt).
         if task_name not in self._visible_task_names(step, user):
             raise HTTPException(status_code=400, detail="Task is not currently available")
 
+        done = set(user["completed_tasks"])
+
+        # --- Enforce sequential step order ---
+        # All steps before this one must be fully complete before proceeding.
+        step_index = next(i for i, s in enumerate(self.flow) if s.name == step_name)
+        for prev_step in self.flow[:step_index]:
+            if not self._step_fully_done(prev_step, user, done):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Step '{prev_step.name}' must be completed before '{step_name}'",
+                )
+
+        # --- Enforce sequential task order within the step ---
+        # All visible tasks listed before this one must be complete first.
+        visible = self._visible_task_names(step, user)
+        task_index = visible.index(task_name)
+        for prev_task_name in visible[:task_index]:
+            if (
+                step.name == STEP_IQ_TEST
+                and prev_task_name == TASK_TAKE_IQ_TEST
+                and task_name == TASK_SECOND_CHANCE_TEST
+            ):
+                continue
+            if f"{step_name}.{prev_task_name}" not in done:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Task '{prev_task_name}' must be completed before '{task_name}'",
+                )
+
+        # --- Idempotency: duplicate webhook events are safe to replay ---
         key = f"{step_name}.{task_name}"
-        if key in user["completed_tasks"]:
+        if key in done:
             return {
                 "message": f"Task {key} already completed",
                 "user_id": user_id,
                 "step_name": step_name,
                 "task_name": task_name,
                 "task_key": key,
-                "passed": "true",
+                "passed": True,
             }
 
+        # A task that was already attempted (but failed) cannot be retried.
+        # Only valid payloads consume the attempt — see recording point below.
+        if key in user.get("attempted_tasks", set()):
+            raise HTTPException(status_code=400, detail="Task has already been attempted")
+
+        # --- Validate required payload fields ---
         required = task_def.required_payload_fields
         if required:
             for fname in required:
                 if fname not in payload or payload[fname] is None:
                     raise HTTPException(status_code=400, detail=f"Missing required field: {fname}")
 
-        self._touch_iq_context(user, step_name, task_name, payload)
+        # Run task-specific payload validation (e.g. score must be a number, decision must be a known value).
+        if task_def.payload_validator:
+            try:
+                task_def.payload_validator(payload)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        # Let the task update user context (e.g. storing a score) before pass_rule runs,
+        # so visibility rules on the same request see the updated values immediately.
+        if task_def.context_extractor:
+            user["context"].update(task_def.context_extractor(payload))
+
+        # Record the attempt now — payload is valid, so this submission counts regardless of outcome.
+        user["attempted_tasks"].add(key)
+
+        # --- Evaluate pass/reject rules ---
         passed = bool(task_def.pass_rule(payload))
         if not passed:
             policy = task_def.reject_on_fail
+            # Static True means always reject on fail (e.g. second chance test); a callable makes rejection conditional on the payload.
             if policy is True:
                 user["status"] = "rejected"
             elif callable(policy) and policy(payload):
@@ -287,9 +360,10 @@ class AdmissionsService:
                 "step_name": step_name,
                 "task_name": task_name,
                 "task_key": key,
-                "passed": "false",
+                "passed": False,
             }
 
+        # Task passed — record it and check if the whole flow is now complete.
         user["completed_tasks"].append(key)
         self._recompute_user_status(user)
 
@@ -299,5 +373,5 @@ class AdmissionsService:
             "step_name": step_name,
             "task_name": task_name,
             "task_key": key,
-            "passed": "true",
+            "passed": True,
         }
